@@ -10,11 +10,13 @@ set -Eeuo pipefail
 
 readonly MODPROBE_FILE=/etc/modprobe.d/90-nvidia-580xx-drm.conf
 readonly MODPROBE_CONTENT=$'# NVIDIA 580xx: DRM KMS and framebuffer for Wayland and consoles.\noptions nvidia_drm modeset=1 fbdev=1\n'
+readonly PACMAN_CONFIG=/etc/pacman.conf
 changed=0
 initramfs_tool=''
 package_source=''
 aur_helper=''
 bootstrap_aur_helper=0
+enable_multilib=0
 declare -a header_packages=() kernel_versions=() driver_packages=()
 
 info() { printf '%s\n' "[INFO] $*"; }
@@ -42,6 +44,7 @@ in_repo() { pacman -Si "$1" &>/dev/null; }
 check_platform() {
   [[ $(uname -m) == x86_64 ]] || die 'Only x86_64 is supported.'
   command -v pacman >/dev/null || die 'pacman was not found.'
+  command -v pacman-conf >/dev/null || die 'pacman-conf is required to check configured repositories.'
   [[ -r /etc/os-release ]] || die '/etc/os-release is missing.'
   # shellcheck disable=SC1091
   source /etc/os-release
@@ -230,6 +233,7 @@ install_aur_helper() {
   printf '\n%s\n' "Review $source_dir/PKGBUILD and any files it uses:"
   cat "$source_dir/PKGBUILD"
   printf '\n%s\n' "The package above will be built by your normal user, then installed through makepkg."
+  printf '%s\n' 'makepkg may request sudo to install dependencies and the finished package.'
   read -r -p "Type BUILD to build and install $aur_helper: " answer
   [[ $answer == BUILD ]] || die 'AUR helper build cancelled.'
   (cd "$source_dir" && makepkg -si)
@@ -243,6 +247,77 @@ multilib_enabled() {
   command -v pacman-conf >/dev/null || return 1
   repos=$(pacman-conf --repo-list) || return 1
   [[ $'\n'${repos}$'\n' == *$'\nmultilib\n'* ]]
+}
+
+render_multilib_config() {
+  local original=$1 rendered=$2
+  awk '
+    function fail(message) {
+      print message > "/dev/stderr"
+      failed = 1
+      exit 1
+    }
+    /^[[:space:]]*#*[[:space:]]*\[multilib\]/ {
+      if ($0 !~ /^[[:space:]]*#[[:space:]]*\[multilib\][[:space:]]*$/)
+        fail("Unexpected [multilib] section; edit pacman.conf manually.")
+      if (seen++)
+        fail("Multiple [multilib] sections; edit pacman.conf manually.")
+      if ((getline include) <= 0 ||
+          include !~ /^[[:space:]]*#[[:space:]]*Include[[:space:]]*=[[:space:]]*\/etc\/pacman\.d\/mirrorlist[[:space:]]*$/)
+        fail("Nonstandard commented [multilib] section; edit pacman.conf manually.")
+      print "[multilib]"
+      print "Include = /etc/pacman.d/mirrorlist"
+      next
+    }
+    { print }
+    END {
+      if (!failed && !seen) {
+        print ""
+        print "[multilib]"
+        print "Include = /etc/pacman.d/mirrorlist"
+      }
+    }
+  ' "$original" > "$rendered"
+}
+
+activate_multilib() {
+  local original rendered backup candidate
+  [[ -f $PACMAN_CONFIG && ! -L $PACMAN_CONFIG && -r $PACMAN_CONFIG ]] ||
+    die "$PACMAN_CONFIG is not a readable regular file or is a symlink. Configure [multilib] manually."
+  [[ -r /etc/pacman.d/mirrorlist ]] || die 'The pacman mirrorlist is missing or unreadable.'
+  if multilib_enabled; then
+    info '[multilib] is already enabled; no configuration change is needed.'
+    return 0
+  fi
+  original=$(mktemp)
+  rendered=$(mktemp)
+  cp -- "$PACMAN_CONFIG" "$original"
+  if ! render_multilib_config "$original" "$rendered"; then
+    rm -f -- "$original" "$rendered"
+    die 'Cannot safely enable [multilib] automatically.'
+  fi
+  if ! cmp -s -- "$original" "$PACMAN_CONFIG"; then
+    rm -f -- "$original" "$rendered"
+    die "$PACMAN_CONFIG changed during review; rerun the installer."
+  fi
+  backup=$(sudo mktemp "${PACMAN_CONFIG}.nvidia-580xx-backup.XXXXXXXX")
+  sudo cp -a -- "$PACMAN_CONFIG" "$backup"
+  candidate=$(sudo mktemp "${PACMAN_CONFIG}.nvidia-580xx-new.XXXXXXXX")
+  sudo cp -a -- "$PACMAN_CONFIG" "$candidate"
+  sudo tee "$candidate" < "$rendered" > /dev/null
+  if ! cmp -s -- "$original" "$PACMAN_CONFIG"; then
+    sudo rm -f -- "$candidate"
+    rm -f -- "$original" "$rendered"
+    die "$PACMAN_CONFIG changed before replacement; original configuration was not overwritten. Backup: $backup"
+  fi
+  changed=1
+  sudo mv -T -- "$candidate" "$PACMAN_CONFIG"
+  rm -f -- "$original" "$rendered"
+  if ! multilib_enabled; then
+    sudo mv -T -- "$backup" "$PACMAN_CONFIG"
+    die 'The new pacman configuration did not enable [multilib]; original configuration was restored.'
+  fi
+  info "Enabled [multilib]. Original configuration backup: $backup"
 }
 
 select_packages() {
@@ -264,9 +339,13 @@ select_packages() {
     [[ $answer == [yY] || $answer == [yY][eE][sS] ]] && need32=1
   fi
   if (( need32 )) && ! multilib_enabled; then
-    die 'Enable [multilib] in /etc/pacman.conf, refresh repositories, and rerun. This script does not rewrite pacman.conf.'
+    read -r -p 'Enable [multilib] in /etc/pacman.conf during installation? [y/N] ' answer
+    [[ $answer == [yY] || $answer == [yY][eE][sS] ]] ||
+      die '32-bit libraries require [multilib]. Enable it manually or rerun and accept the option.'
+    enable_multilib=1
   fi
-  if (( need32 )) && [[ $package_source == repo ]] && ! in_repo lib32-nvidia-580xx-utils; then
+  if (( need32 )) && (( ! enable_multilib )) && [[ $package_source == repo ]] &&
+     ! in_repo lib32-nvidia-580xx-utils; then
     die 'The 64-bit 580xx packages are in repositories, but matching 32-bit packages are missing.'
   fi
 
@@ -304,11 +383,15 @@ install_driver() {
   select_packages
 
   printf '\n%s\n' 'Installation will upgrade the system, install kernel headers and NVIDIA 580xx, then rebuild initramfs images.'
+  if (( enable_multilib )); then
+    printf '%s\n' 'It will first enable [multilib] in /etc/pacman.conf and save a backup.'
+  fi
   printf '%s\n' 'Review all package conflicts and AUR build files shown by your package manager.'
   local answer
   read -r -p 'Type INSTALL to continue: ' answer
   [[ $answer == INSTALL ]] || die 'Installation cancelled.'
   sudo -v
+  if (( enable_multilib )); then activate_multilib; fi
   if [[ $package_source == repo ]]; then
     changed=1
     sudo pacman -Syu --needed "${header_packages[@]}" "${driver_packages[@]}"
@@ -401,8 +484,10 @@ Run as a normal user (not with sudo):
 
 The interactive menu uses English. Installation needs sudo, a supported NVIDIA
 GPU, and kernel headers. If AUR packages are needed, choose paru or yay; if
-the selected helper is missing, the script offers to build and install it.
-For Steam/Wine, enable [multilib] before selecting 32-bit driver libraries.
+the selected helper is missing, the script offers to build it as your user.
+Installing packages or build dependencies still needs sudo via pacman.
+For Steam/Wine, choose 32-bit libraries; if [multilib] is disabled, the script
+offers to enable it after final confirmation and saves a pacman.conf backup.
 Manjaro is excluded because its mhwd NVIDIA profiles require a separate flow.
 Secure Boot systems are stopped because signing and key enrollment need
 separate verification.
